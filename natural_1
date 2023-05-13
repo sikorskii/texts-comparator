@@ -1,0 +1,188 @@
+Now that we’ve seen a few use cases that require multiple Kafka clusters, let’s look at
+some common architectural patterns that we’ve successfully used when implementing
+these use cases. Before we go into the architectures, we’ll give a brief overview of the
+realities of cross-datacenter communications. The solutions we’ll discuss may seem overly complicated without understanding that they represent trade-offs in the face of
+specific network conditions.
+Some Realities of Cross-Datacenter Communication
+The following is a list of some things to consider when it comes to cross-datacenter
+communication:
+High latencies
+Latency of communication between two Kafka clusters increases as the distance
+and the number of network hops between the two clusters increase.
+Limited bandwidth
+Wide area networks (WANs) typically have far lower available bandwidth than
+what you’ll see inside a single datacenter, and the available bandwidth can vary
+minute to minute. In addition, higher latencies make it more challenging to uti‐
+lize all the available bandwith.
+Higher costs
+Regardless of whether you are running Kafka on-premise or in the cloud, there
+are higher costs to communicate between clusters. This is partly because the
+bandwidth is limited and adding bandwidth can be prohibitively expensive, and
+also because of the prices vendors charge for transferring data between datacen‐
+ters, regions, and clouds.
+Apache Kafka’s brokers and clients were designed, developed, tested, and tuned all
+within a single datacenter. We assumed low latency and high bandwidth between
+brokers and clients. This is apparent in default timeouts and sizing of various buffers.
+For this reason, it is not recommended (except in specific cases, which we’ll discuss
+later) to install some Kafka brokers in one datacenter and others in another datacen‐
+ter.
+In most cases, it’s best to avoid producing data to a remote datacenter, and when you
+do, you need to account for higher latency and the potential for more network errors.
+You can handle the errors by increasing the number of producer retries and handle
+the higher latency by increasing the size of the buffers that hold records between
+attempts to send them.
+If we need any kind of replication between clusters and we ruled out inter-broker
+communication and producer-broker communication, then we must allow for
+broker-consumer communication. Indeed, this is the safest form of cross-cluster
+communication because in the event of network partition that prevents a consumer
+from reading data, the records remain safe inside the Kafka brokers until communi‐
+cations resume and consumers can read them. There is no risk of accidental data loss
+due to network partitions. Still, because bandwidth is limited, if there are multiple
+applications in one datacenter that need to read data from Kafka brokers in another datacenter, we prefer to install a Kafka cluster in each datacenter and mirror the nec‐
+essary data between them once rather than have multiple applications consume the
+same data across the WAN.
+We’ll talk more about tuning Kafka for cross-datacenter communication, but the fol‐
+lowing principles will guide most of the architectures we’ll discuss next:
+• No less than one cluster per datacenter
+• Replicate each event exactly once (barring retries due to errors) between each
+pair of datacenters
+• When possible, consume from a remote datacenter rather than produce to a
+remote datacenter This architecture is used when data is produced in multiple datacenters and some
+consumers need access to the entire data set. The architecture also allows for applica‐
+tions in each datacenter to only process data local to that specific datacenter. But it
+does not give access to the entire data set from each datacenter.
+The main benefit of this architecture is that data is always produced to the local datacenter and that events from each datacenter are only mirrored once—to the central
+datacenter. Applications that process data from a single datacenter can be located at
+that datacenter. Applications that need to process data from multiple datacenters will
+be located at the central datacenter where all the events are mirrored. Because replica‐
+tion always goes in one direction and because each consumer always reads from the
+same cluster, this architecture is simple to deploy, configure, and monitor.
+The main drawbacks of this architecture are the direct results of its benefits and sim‐
+plicity. Processors in one regional datacenter can’t access data in another. To under‐
+stand better why this is a limitation, let’s look at an example of this architecture.
+Suppose that we are a large bank and have branches in multiple cities. Let’s say that
+we decide to store user profiles and their account history in a Kafka cluster in each
+city. We replicate all this information to a central cluster that is used to run the bank’s
+business analytics. When users connect to the bank website or visit their local branch,
+they are routed to send events to their local cluster and read events from the same
+local cluster. However, suppose that a user visits a branch in a different city. Because
+the user information doesn’t exist in the city he is visiting, the branch will be forced to
+interact with a remote cluster (not recommended) or have no way to access the user’s
+information (really embarrassing). For this reason, use of this pattern is usually limi‐
+ted to only parts of the data set that can be completely separated between regional
+datacenters.
+When implementing this architecture, for each regional datacenter you need at least
+one mirroring process on the central datacenter. This process will consume data from
+each remote regional cluster and produce it to the central cluster. If the same topic
+exists in multiple datacenters, you can write all the events from this topic to one topic
+with the same name in the central cluster, or write events from each datacenter to a
+separate topic. Active-Active Architecture
+This architecture is used when two or more datacenters share some or all of the data
+and each datacenter is able to both produce and consume events. See Figure 8-3 The main benefits of this architecture are the ability to serve users from a nearby
+datacenter, which typically has performance benefits, without sacrificing functionality
+due to limited availability of data (as we’ve seen happen in the hub-and-spokes archi‐
+tecture). A secondary benefit is redundancy and resilience. Since every datacenter has
+all the functionality, if one datacenter is unavailable you can direct users to a remain‐
+ing datacenter. This type of failover only requires network redirects of users, typically
+the easiest and most transparent type of failover.
+The main drawback of this architecture is the challenges in avoiding conflicts when
+data is read and updated asynchronously in multiple locations. This includes techni‐
+cal challenges in mirroring events—for example, how do we make sure the same
+event isn’t mirrored back and forth endlessly? But more important, maintaining data
+consistency between the two datacenters will be difficult. Here are few examples of
+the difficulties you will encounter:
+• If a user sends an event to one datacenter and reads events from another datacen‐
+ter, it is possible that the event they wrote hasn’t arrived the second datacenter
+yet. To the user, it will look like he just added a book to his wish list, clicked on
+the wish list, but the book isn’t there. For this reason, when this architecture is
+used, the developers usually find a way to “stick” each user to a specific datacen‐
+ter and make sure they use the same cluster most of the time (unless they connect
+from a remote location or the datacenter becomes unavailable).
+• An event from one datacenter says user ordered book A and an event from more
+or less the same time at a second datacenter says that the same user ordered book
+B. After mirroring, both datacenters have both events and thus we can say that
+each datacenter has two conflicting events. Applications on both datacenters
+need to know how to deal with this situation. Do we pick one event as the “cor‐
+rect” one? If so, we need consistent rules on how to pick one so applications on
+both datacenters will arrive at the same conclusion. Do we decide that both are
+true and simply send the user two books and have another department deal with
+returns? Amazon used to resolve conflicts that way, but organizations dealing
+with stock trades, for example, can’t. The specific method for minimizing con‐
+flicts and handling them when they occur is specific to each use case. It is impor‐
+tant to keep in mind that if you use this architecture, you will have conflicts and
+will need to deal with them.
+If you find ways to handle the challenges of asynchronous reads and writes to the
+same data set from multiple locations, then this architecture is highly recommended.
+It is the most scalable, resilient, flexible, and cost-effective option we are aware of. So
+it is well worth the effort to figure out solutions for avoiding replication cycles, keep‐
+ing users mostly in the same datacenter, and handling conflicts when they occur.
+Part of the challenge of active-active mirroring, especially with more than two data‐
+centers, is that you will need a mirroring process for each pair of datacenters and each
+direction. With five datacenters, you need to maintain at least 20 mirroring processes
+—and more likely 40, since each process needs redundancy for high availability.
+In addition, you will want to avoid loops in which the same event is mirrored backand-forth endlessly. You can do this by giving each “logical topic” a separate topic for
+each datacenter and making sure to avoid replicating topics that originated in remote
+datacenters. For example, logical topic users will be topic SF.users in one datacenter
+and NYC.users in another datacenter. The mirroring processes will mirror topic
+SF.users from SF to NYC and topic NYC.users from NYC to SF. As a result, each event
+will only be mirrored once, but each datacenter will contain both SF.users and
+NYC.users, which means each datacenter will have information for all the users. Con‐
+sumers will need to consume events from .users if they wish to consume all user
+events. Another way to think of this setup is to see it as a separate namespace for each
+datacenter that contains all the topics for the specific datacenter. In our example, we’ll
+have the NYC and the SF namespaces.
+Note that in the near future (and perhaps before you read this book), Apache Kafka
+will add record headers. This will allow tagging events with their originating datacen‐
+ter and using this header information to avoid endless mirroring loops and also to
+allow processing events from different datacenters separately. You can still implement
+this feature by using a structured data format for the record values (Avro is our favor‐
+ite example) and use this to include tags and headers in the event itself. However, this
+does require extra effort when mirroring, since none of the existing mirroring tools
+will support your specific header format. The benefits of this setup is simplicity in setup and the fact that it can be used in
+pretty much any use case. You simply install a second cluster and set up a mirroring
+process that streams all the events from one cluster to another. No need to worry
+about access to data, handling conflicts, and other architectural complexities.
+The disadvantages are waste of a good cluster and the fact that failover between Kafka
+clusters is, in fact, much harder than it looks. The bottom line is that it is currently
+not possible to perform cluster failover in Kafka without either losing data or having
+duplicate events. Often both. You can minimize them, but never fully eliminate them.
+It should be obvious that a cluster that does nothing except wait around for a disaster
+is a waste of resources. Since disasters are (or should be) rare, most of the time we are
+looking at a cluster of machines that does nothing at all. Some organizations try to
+fight this issue by having a DR (disaster recovery) cluster that is much smaller than
+the production cluster. But this is a risky decision because you can’t be sure that this
+minimally sized cluster will hold up during an emergency. Other organizations prefer
+to make the cluster useful during non-disasters by shifting some read-only workloads
+to run on the DR cluster, which means they are really running a small version of a
+hub-and-spoke architecture with a single spoke.
+The more serious issue is, how do you failover to a DR cluster in Apache Kafka?
+First, it should go without saying that whichever failover method you choose, your
+SRE team must practice it on a regular basis. A plan that works today may stop work‐
+ing after an upgrade, or perhaps new use cases make the existing tooling obsolete.
+Once a quarter is usually the bare minimum for failover practices. Strong SRE teams
+practice far more frequently. Netflix’s famous Chaos Monkey, a service that randomly
+causes disasters, is the extreme—any day may become failover practice day.
+Now, let’s take a look at what is involved in a failover. Data loss and inconsistencies in unplanned failover
+Because Kafka’s various mirroring solutions are all asynchronous (we’ll discuss a syn‐
+chronous solution in the next section), the DR cluster will not have the latest mes‐
+sages from the primary cluster. You should always monitor how far behind the DR
+cluster is and never let it fall too far behind. But in a busy system you should expect
+the DR cluster to be a few hundred or even a few thousand messages behind the pri‐
+mary. If your Kafka cluster handles 1 million messages a second and there is a 5 milli‐
+second lag between the primary and the DR cluster is 5 milliseconds, your DR cluster
+will be 5,000 messages behind the primary in the best-case scenario. So prepare for
+unplanned failover to include some data loss. In planned failover, you can stop the
+primary cluster and wait for the mirroring process to mirror the remaining messages
+before failing over applications to the DR cluster, thus avoiding this data loss. When
+unplanned failover occurs and you lose a few thousand messages, note that Kafka
+currently has no concept of transactions, which means that if some events in multiple
+topics are related to each other (e.g., sales and line-items), you can have some events
+arrive to the DR site in time for the failover and others that don’t. Your applications
+will need to be able to handle a line item without a corresponding sale after you fail‐
+over to the DR cluster.
+Start offset for applications after failover
+Perhaps the most challenging part in failing over to another cluster is making sure
+applications know where to start consuming data. There are several common
+approaches. Some are simple but can cause additional data loss or duplicate process‐
+ing; others are more involved but minimize additional data loss and reprocessing.
+Let’s take a look at a few:
